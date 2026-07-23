@@ -1,9 +1,8 @@
 """Launch the existing macro UI with experimental Roblox Background Mode.
 
 Normal `python main.py` remains unchanged. This launcher reuses the existing
-UI, task system, runner, vision code, and recovery logic, but keeps Roblox as a
-separate top-level window and swaps the runner to window-specific input once a
-Roblox window passes the background health check.
+UI, task system, runner, vision code, and recovery logic. The capture adapter
+now verifies the live visible Roblox region instead of trusting PrintWindow.
 """
 
 from __future__ import annotations
@@ -15,17 +14,10 @@ import time
 import main
 from core import vision
 from core.background import BackgroundModeController, BackgroundMouse, BackgroundKeyboard
-from core.mouse import Mouse
-from core.keyboard import Keyboard
 
 
 class BackgroundDocker:
-    """Compatibility layer that prevents Roblox from being reparented.
-
-    The existing watchdog still sees a docked game and keeps its normal state
-    machine, but Roblox remains a separate top-level window. Window-content
-    capture is used so the game can sit behind other applications.
-    """
+    """Compatibility layer that prevents Roblox from being reparented."""
 
     def __init__(self, original):
         self._original = original
@@ -57,7 +49,8 @@ class BackgroundApi(main.Api):
         self._background_stop = threading.Event()
         threading.Thread(target=self._background_watchdog, daemon=True).start()
         self.push_log("[Background] Experimental Background Mode enabled.")
-        self.push_log("[Background] Roblox stays in a separate window. Normal mode is unchanged.")
+        self.push_log("[Background] Live Roblox-region capture enabled. Keep Roblox visible during this test.")
+        self.push_log("[Background] Normal mode remains unchanged.")
 
     def _background_watchdog(self):
         while not self.stopping.is_set() and not self._background_stop.is_set():
@@ -67,13 +60,17 @@ class BackgroundApi(main.Api):
                     controller = BackgroundModeController(hwnd)
                     health = controller.health_check()
                     if not health.capture_ok or not health.capture_nonempty:
-                        raise RuntimeError(health.error or "Roblox window capture returned no usable pixels")
+                        raise RuntimeError(health.error or "Roblox live capture returned no usable pixels")
                     self._background_controller = controller
                     self.runner._mouse = BackgroundMouse(controller)
                     self.runner._keyboard = BackgroundKeyboard(controller)
                     self._background_active_hwnd = hwnd
                     self.push_log(
-                        f"[Background] Ready. Roblox capture: {health.client_size[0]}x{health.client_size[1]}."
+                        f"[Background] Live capture ready: {health.client_size[0]}x{health.client_size[1]} "
+                        f"via {health.capture_source}."
+                    )
+                    self.push_log(
+                        "[Background] This test capture is visible-region based. Do not cover Roblox yet."
                     )
                 except Exception as exc:
                     self._background_controller = None
@@ -94,8 +91,6 @@ class BackgroundApi(main.Api):
         super().close_window()
 
 
-# _launch_ui creates the API through main.Api. Replacing the class before
-# entering the existing launcher keeps every other UI and runner path intact.
 main.Api = BackgroundApi
 
 if __name__ == "__main__":
