@@ -20,6 +20,8 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from typing import Optional
 
+from . import pacing
+
 if sys.platform != "win32":
     raise RuntimeError("Background Mode is currently supported on Windows only")
 
@@ -41,9 +43,11 @@ WM_CHAR = 0x0102
 MK_LBUTTON = 0x0001
 MK_RBUTTON = 0x0002
 MK_MBUTTON = 0x0010
-VK_SHIFT = 0x10
-VK_CONTROL = 0x11
-VK_MENU = 0x12
+
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
 
 class RECT(ctypes.Structure):
     _fields_ = [
@@ -52,6 +56,7 @@ class RECT(ctypes.Structure):
         ("right", ctypes.c_long),
         ("bottom", ctypes.c_long),
     ]
+
 
 class BITMAPINFOHEADER(ctypes.Structure):
     _fields_ = [
@@ -68,8 +73,10 @@ class BITMAPINFOHEADER(ctypes.Structure):
         ("biClrImportant", wintypes.DWORD),
     ]
 
+
 class BITMAPINFO(ctypes.Structure):
     _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 3)]
+
 
 @dataclass(frozen=True)
 class BackgroundHealth:
@@ -91,14 +98,15 @@ def _client_size(hwnd: int) -> tuple[int, int]:
     return rect.right - rect.left, rect.bottom - rect.top
 
 
-def _capture_client(hwnd: int):
-    """Capture the client area into a BGRA numpy array.
+def _screen_to_client(hwnd: int, x: int, y: int) -> tuple[int, int]:
+    point = POINT(int(x), int(y))
+    if not user32.ScreenToClient(hwnd, ctypes.byref(point)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return point.x, point.y
 
-    PrintWindow asks the target window to render into a compatible bitmap,
-    which allows capture without moving the user's cursor or changing the
-    foreground window. A small BitBlt fallback handles windows that refuse
-    PW_RENDERFULLCONTENT.
-    """
+
+def _capture_client(hwnd: int):
+    """Capture the client area into a BGRA numpy array."""
     import numpy as np
 
     width, height = _client_size(hwnd)
@@ -127,13 +135,7 @@ def _capture_client(hwnd: int):
         bmi.bmiHeader.biCompression = 0
         buffer = (ctypes.c_ubyte * (width * height * 4))()
         copied = gdi32.GetDIBits(
-            mem_dc,
-            bitmap,
-            0,
-            height,
-            ctypes.byref(buffer),
-            ctypes.byref(bmi),
-            0,
+            mem_dc, bitmap, 0, height, ctypes.byref(buffer), ctypes.byref(bmi), 0
         )
         if copied != height:
             return None
@@ -146,12 +148,7 @@ def _capture_client(hwnd: int):
 
 
 class BackgroundModeController:
-    """Window-specific Roblox capture and input controller.
-
-    This class does not change the global mouse position and does not activate
-    the Roblox window. It is intentionally separate from core.mouse and
-    core.keyboard so the existing macro path remains untouched.
-    """
+    """Window-specific Roblox capture and input controller."""
 
     def __init__(self, hwnd: int):
         if not hwnd or not user32.IsWindow(hwnd):
@@ -202,6 +199,90 @@ class BackgroundModeController:
             return BackgroundHealth(True, size, capture_ok, nonempty)
         except Exception as exc:
             return BackgroundHealth(True, (0, 0), False, False, str(exc))
+
+
+class BackgroundMouse:
+    """Screen-coordinate mouse API compatible with core.mouse.Mouse."""
+
+    def __init__(self, controller: BackgroundModeController):
+        self.controller = controller
+
+    def _client(self, x: int, y: int) -> tuple[int, int]:
+        return _screen_to_client(self.controller.hwnd, x, y)
+
+    def move_to(self, x: int, y: int) -> None:
+        cx, cy = self._client(x, y)
+        self.controller.move(cx, cy)
+
+    def down(self, button: str = "left") -> None:
+        # Background clicks are emitted as a complete click by click().
+        raise RuntimeError("BackgroundMouse.down() is not supported independently")
+
+    def up(self, button: str = "left") -> None:
+        raise RuntimeError("BackgroundMouse.up() is not supported independently")
+
+    def nudge(self, dx: int = 1, dy: int = 0) -> None:
+        return None
+
+    def click(self, x: int = None, y: int = None, button: str = "left", hold: float = 0.05) -> None:
+        if x is None or y is None:
+            raise ValueError("Background clicks require coordinates")
+        cx, cy = self._client(x, y)
+        self.controller.move(cx, cy)
+        time.sleep(0.01)
+        self.controller.click(cx, cy, button)
+        if hold > 0:
+            time.sleep(hold)
+        pacing.action_pause()
+
+    def double_click(self, x: int = None, y: int = None, button: str = "left", gap: float = 0.08) -> None:
+        self.click(x, y, button)
+        time.sleep(gap)
+        self.click(x, y, button)
+
+    def shuffle_click(self, x: int, y: int, button: str = "left", hold: float = 0.05) -> None:
+        self.click(x, y, button, hold)
+
+    def drag(self, x1: int, y1: int, x2: int, y2: int, button: str = "left", steps: int = 15, duration: float = 0.2) -> None:
+        raise RuntimeError("Background drag is not supported yet")
+
+    def scroll(self, amount: int) -> None:
+        raise RuntimeError("Background scroll is not supported yet")
+
+    def position(self):
+        return None
+
+
+class BackgroundKeyboard:
+    """Keyboard API compatible with core.keyboard.Keyboard."""
+
+    def __init__(self, controller: BackgroundModeController):
+        self.controller = controller
+
+    def key_down(self, vk: int) -> None:
+        self.controller.key_down(vk)
+
+    def key_up(self, vk: int) -> None:
+        self.controller.key_up(vk)
+
+    def tap(self, vk: int, hold: float = 0.03, pace: bool = True) -> None:
+        self.controller.tap(vk, hold)
+        if pace:
+            pacing.action_pause()
+
+    def type_text(self, text: str, delay: float = 0.02) -> None:
+        for ch in text:
+            self.tap(ord(ch.upper()), pace=False)
+            time.sleep(delay)
+        pacing.action_pause()
+
+    def combo(self, *vks: int, hold: float = 0.05) -> None:
+        for vk in vks:
+            self.key_down(vk)
+        time.sleep(hold)
+        for vk in reversed(vks):
+            self.key_up(vk)
+        pacing.action_pause()
 
 
 def find_roblox_window(title_substring: str = "Roblox") -> Optional[int]:
