@@ -37,11 +37,18 @@ class RECT(ctypes.Structure):
 
 
 class MOUSEINPUT(ctypes.Structure):
-    _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long), ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+    _fields_ = [
+        ("dx", ctypes.c_long), ("dy", ctypes.c_long), ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
 
 
 class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+    _fields_ = [
+        ("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
 
 
 class HARDWAREINPUT(ctypes.Structure):
@@ -113,7 +120,6 @@ def _send_key(vk: int, flags: int = 0) -> None:
 
 
 def _focus_window(hwnd: int) -> None:
-    """Give Roblox real foreground focus before SendInput reaches it."""
     user32.ShowWindow(hwnd, SW_RESTORE)
     user32.BringWindowToTop(hwnd)
     if not user32.SetForegroundWindow(hwnd):
@@ -124,6 +130,23 @@ def _focus_window(hwnd: int) -> None:
             return
         time.sleep(0.01)
     raise RuntimeError("Windows did not grant Roblox foreground focus")
+
+
+def _screen_point_for_client(hwnd: int, x: int, y: int) -> tuple[int, int]:
+    origin_x, origin_y = _client_origin_screen(hwnd)
+    return origin_x + int(x), origin_y + int(y)
+
+
+def _move_cursor_verified(screen_x: int, screen_y: int) -> None:
+    if not user32.SetCursorPos(int(screen_x), int(screen_y)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    point = POINT()
+    if not user32.GetCursorPos(ctypes.byref(point)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if (point.x, point.y) != (int(screen_x), int(screen_y)):
+        raise RuntimeError(
+            f"Cursor landed at ({point.x},{point.y}), expected ({int(screen_x)},{int(screen_y)})"
+        )
 
 
 class BackgroundModeController:
@@ -138,21 +161,17 @@ class BackgroundModeController:
     def capture(self):
         return _capture_client(self.hwnd)
 
+    def move(self, x: int, y: int) -> None:
+        """Move the real cursor to Roblox client coordinates."""
+        screen_x, screen_y = _screen_point_for_client(self.hwnd, x, y)
+        _move_cursor_verified(screen_x, screen_y)
+
     def click(self, x: int, y: int, button: str = "left") -> None:
         """Click exact Roblox-client coordinates with real foreground input."""
-        origin_x, origin_y = _client_origin_screen(self.hwnd)
-        screen_x = origin_x + int(x)
-        screen_y = origin_y + int(y)
-
         _focus_window(self.hwnd)
         time.sleep(0.12)
-        if not user32.SetCursorPos(screen_x, screen_y):
-            raise ctypes.WinError(ctypes.get_last_error())
-
-        point = POINT()
-        user32.GetCursorPos(ctypes.byref(point))
-        if (point.x, point.y) != (screen_x, screen_y):
-            raise RuntimeError(f"Cursor landed at ({point.x},{point.y}), expected ({screen_x},{screen_y})")
+        screen_x, screen_y = _screen_point_for_client(self.hwnd, x, y)
+        _move_cursor_verified(screen_x, screen_y)
 
         flags = {
             "left": (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
@@ -162,7 +181,6 @@ class BackgroundModeController:
         _send_mouse(flags[0])
         time.sleep(0.06)
         _send_mouse(flags[1])
-        # Keep Roblox focused briefly so its UI receives and processes the event.
         time.sleep(0.35)
 
     def key_down(self, vk: int) -> None:
@@ -192,7 +210,7 @@ class BackgroundMouse:
         self.controller = controller
 
     def move_to(self, x: int, y: int) -> None:
-        return None
+        self.controller.move(int(x), int(y))
 
     def click(self, x: int = None, y: int = None, button: str = "left", hold: float = 0.05) -> None:
         if x is None or y is None:
@@ -214,6 +232,9 @@ class BackgroundMouse:
         return None
 
     def position(self):
+        point = POINT()
+        if user32.GetCursorPos(ctypes.byref(point)):
+            return point.x, point.y
         return None
 
     def down(self, button: str = "left") -> None:
