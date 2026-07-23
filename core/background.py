@@ -16,21 +16,8 @@ if sys.platform != "win32":
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 
-WM_MOUSEMOVE = 0x0200
-WM_LBUTTONDOWN = 0x0201
-WM_LBUTTONUP = 0x0202
-WM_RBUTTONDOWN = 0x0204
-WM_RBUTTONUP = 0x0205
-WM_MBUTTONDOWN = 0x0207
-WM_MBUTTONUP = 0x0208
-MK_LBUTTON = 0x0001
-MK_RBUTTON = 0x0002
-MK_MBUTTON = 0x0010
-WM_KEYDOWN = 0x0100
-WM_KEYUP = 0x0101
 INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
-MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 MOUSEEVENTF_RIGHTDOWN = 0x0008
@@ -49,11 +36,18 @@ class RECT(ctypes.Structure):
 
 
 class MOUSEINPUT(ctypes.Structure):
-    _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long), ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+    _fields_ = [
+        ("dx", ctypes.c_long), ("dy", ctypes.c_long), ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
 
 
 class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+    _fields_ = [
+        ("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
 
 
 class HARDWAREINPUT(ctypes.Structure):
@@ -79,10 +73,6 @@ class BackgroundHealth:
     error: Optional[str] = None
 
 
-def _make_lparam(x: int, y: int) -> int:
-    return (int(y) << 16) | (int(x) & 0xFFFF)
-
-
 def _client_size(hwnd: int) -> tuple[int, int]:
     rect = RECT()
     if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
@@ -93,13 +83,6 @@ def _client_size(hwnd: int) -> tuple[int, int]:
 def _client_origin_screen(hwnd: int) -> tuple[int, int]:
     point = POINT(0, 0)
     if not user32.ClientToScreen(hwnd, ctypes.byref(point)):
-        raise ctypes.WinError(ctypes.get_last_error())
-    return point.x, point.y
-
-
-def _screen_to_client(hwnd: int, x: int, y: int) -> tuple[int, int]:
-    point = POINT(int(x), int(y))
-    if not user32.ScreenToClient(hwnd, ctypes.byref(point)):
         raise ctypes.WinError(ctypes.get_last_error())
     return point.x, point.y
 
@@ -116,9 +99,7 @@ def _capture_client(hwnd: int):
     with mss.mss() as sct:
         shot = sct.grab({"left": left, "top": top, "width": width, "height": height})
         frame = np.asarray(shot, dtype=np.uint8)
-        if frame.size == 0:
-            return None
-        return frame.copy()
+        return frame.copy() if frame.size else None
 
 
 def _send_mouse(flags: int) -> None:
@@ -149,27 +130,29 @@ class BackgroundModeController:
     def capture(self):
         return _capture_client(self.hwnd)
 
-    def move(self, x: int, y: int) -> None:
-        user32.PostMessageW(self.hwnd, WM_MOUSEMOVE, 0, _make_lparam(x, y))
-
     def click(self, x: int, y: int, button: str = "left") -> None:
-        """Use real Windows input for Roblox, restoring the previous app focus."""
-        sx, sy = _client_origin_screen(self.hwnd)
-        screen_x, screen_y = sx + int(x), sy + int(y)
+        """Click a coordinate expressed in the Roblox client capture's coordinate space."""
+        origin_x, origin_y = _client_origin_screen(self.hwnd)
+        screen_x = origin_x + int(x)
+        screen_y = origin_y + int(y)
         previous = user32.GetForegroundWindow()
+
         if not user32.SetForegroundWindow(self.hwnd):
             raise ctypes.WinError(ctypes.get_last_error())
-        time.sleep(0.05)
-        user32.SetCursorPos(screen_x, screen_y)
+        time.sleep(0.08)
+        if not user32.SetCursorPos(screen_x, screen_y):
+            raise ctypes.WinError(ctypes.get_last_error())
+
         flags = {
             "left": (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
             "right": (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
             "middle": (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
         }[button]
         _send_mouse(flags[0])
-        time.sleep(0.03)
+        time.sleep(0.04)
         _send_mouse(flags[1])
-        time.sleep(0.05)
+        time.sleep(0.08)
+
         if previous and user32.IsWindow(previous) and previous != self.hwnd:
             user32.SetForegroundWindow(previous)
 
@@ -199,18 +182,17 @@ class BackgroundMouse:
     def __init__(self, controller: BackgroundModeController):
         self.controller = controller
 
-    def _client(self, x: int, y: int) -> tuple[int, int]:
-        return _screen_to_client(self.controller.hwnd, x, y)
-
     def move_to(self, x: int, y: int) -> None:
-        cx, cy = self._client(x, y)
-        self.controller.move(cx, cy)
+        # Macro coordinates are already relative to the Roblox client capture.
+        # Do not call ScreenToClient here. That was double-converting them.
+        return None
 
     def click(self, x: int = None, y: int = None, button: str = "left", hold: float = 0.05) -> None:
         if x is None or y is None:
             raise ValueError("Background clicks require coordinates")
-        cx, cy = self._client(x, y)
-        self.controller.click(cx, cy, button)
+        # Runner and vision coordinates are Roblox-client coordinates. Convert
+        # to screen coordinates exactly once inside BackgroundModeController.
+        self.controller.click(int(x), int(y), button)
         if hold > 0:
             time.sleep(hold)
         pacing.action_pause()
