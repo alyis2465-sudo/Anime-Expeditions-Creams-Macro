@@ -25,6 +25,7 @@ MOUSEEVENTF_RIGHTUP = 0x0010
 MOUSEEVENTF_MIDDLEDOWN = 0x0020
 MOUSEEVENTF_MIDDLEUP = 0x0040
 KEYEVENTF_KEYUP = 0x0002
+SW_RESTORE = 9
 
 
 class POINT(ctypes.Structure):
@@ -36,18 +37,11 @@ class RECT(ctypes.Structure):
 
 
 class MOUSEINPUT(ctypes.Structure):
-    _fields_ = [
-        ("dx", ctypes.c_long), ("dy", ctypes.c_long), ("mouseData", wintypes.DWORD),
-        ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
-    ]
+    _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long), ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
 
 
 class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [
-        ("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
-        ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
-    ]
+    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
 
 
 class HARDWAREINPUT(ctypes.Structure):
@@ -118,6 +112,20 @@ def _send_key(vk: int, flags: int = 0) -> None:
         raise ctypes.WinError(ctypes.get_last_error())
 
 
+def _focus_window(hwnd: int) -> None:
+    """Give Roblox real foreground focus before SendInput reaches it."""
+    user32.ShowWindow(hwnd, SW_RESTORE)
+    user32.BringWindowToTop(hwnd)
+    if not user32.SetForegroundWindow(hwnd):
+        raise ctypes.WinError(ctypes.get_last_error())
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        if user32.GetForegroundWindow() == hwnd:
+            return
+        time.sleep(0.01)
+    raise RuntimeError("Windows did not grant Roblox foreground focus")
+
+
 class BackgroundModeController:
     def __init__(self, hwnd: int):
         if not hwnd or not user32.IsWindow(hwnd):
@@ -131,17 +139,20 @@ class BackgroundModeController:
         return _capture_client(self.hwnd)
 
     def click(self, x: int, y: int, button: str = "left") -> None:
-        """Click a coordinate expressed in the Roblox client capture's coordinate space."""
+        """Click exact Roblox-client coordinates with real foreground input."""
         origin_x, origin_y = _client_origin_screen(self.hwnd)
         screen_x = origin_x + int(x)
         screen_y = origin_y + int(y)
-        previous = user32.GetForegroundWindow()
 
-        if not user32.SetForegroundWindow(self.hwnd):
-            raise ctypes.WinError(ctypes.get_last_error())
-        time.sleep(0.08)
+        _focus_window(self.hwnd)
+        time.sleep(0.12)
         if not user32.SetCursorPos(screen_x, screen_y):
             raise ctypes.WinError(ctypes.get_last_error())
+
+        point = POINT()
+        user32.GetCursorPos(ctypes.byref(point))
+        if (point.x, point.y) != (screen_x, screen_y):
+            raise RuntimeError(f"Cursor landed at ({point.x},{point.y}), expected ({screen_x},{screen_y})")
 
         flags = {
             "left": (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
@@ -149,12 +160,10 @@ class BackgroundModeController:
             "middle": (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
         }[button]
         _send_mouse(flags[0])
-        time.sleep(0.04)
+        time.sleep(0.06)
         _send_mouse(flags[1])
-        time.sleep(0.08)
-
-        if previous and user32.IsWindow(previous) and previous != self.hwnd:
-            user32.SetForegroundWindow(previous)
+        # Keep Roblox focused briefly so its UI receives and processes the event.
+        time.sleep(0.35)
 
     def key_down(self, vk: int) -> None:
         _send_key(vk)
@@ -183,15 +192,11 @@ class BackgroundMouse:
         self.controller = controller
 
     def move_to(self, x: int, y: int) -> None:
-        # Macro coordinates are already relative to the Roblox client capture.
-        # Do not call ScreenToClient here. That was double-converting them.
         return None
 
     def click(self, x: int = None, y: int = None, button: str = "left", hold: float = 0.05) -> None:
         if x is None or y is None:
             raise ValueError("Background clicks require coordinates")
-        # Runner and vision coordinates are Roblox-client coordinates. Convert
-        # to screen coordinates exactly once inside BackgroundModeController.
         self.controller.click(int(x), int(y), button)
         if hold > 0:
             time.sleep(hold)
