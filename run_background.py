@@ -1,8 +1,10 @@
 """Launch the existing macro UI with experimental Roblox Background Mode.
 
 Normal `python main.py` remains unchanged. This launcher reuses the existing
-UI, task system, runner, vision code, and recovery logic. The capture adapter
-now verifies the live visible Roblox region instead of trusting PrintWindow.
+UI, task system, runner, vision code, and recovery logic. Background Mode keeps
+Roblox as a separate visible window and uses the same live screen capture path
+as the vision system. It does not force PrintWindow capture, because Roblox's
+hardware-rendered surface can return stale content through that API.
 """
 
 from __future__ import annotations
@@ -21,11 +23,12 @@ class BackgroundDocker:
 
     def __init__(self, original):
         self._original = original
-        self.cutout = True
+        self.cutout = False
         self.docked = False
 
     def dock(self, hwnd, parent_hwnd, x=0, y=0):
-        self.docked = True
+        # Background Mode must not reparent or cut out the Roblox window.
+        self.docked = False
         return True
 
     def undock(self, hwnd):
@@ -42,15 +45,18 @@ class BackgroundApi(main.Api):
     def __init__(self):
         super().__init__()
         self.docker = BackgroundDocker(self.docker)
-        self.game_cutout = True
-        vision.force_window_capture()
+        self.game_cutout = False
+        # Critical: do not force PrintWindow. The vision pipeline must use the
+        # same live visible-region capture path as BackgroundModeController.
+        # PrintWindow was the source of stale or mismatched Roblox frames.
+        vision._use_window_capture = False
         self._background_controller = None
         self._background_active_hwnd = None
         self._background_stop = threading.Event()
         threading.Thread(target=self._background_watchdog, daemon=True).start()
         self.push_log("[Background] Experimental Background Mode enabled.")
         self.push_log("[Background] Live Roblox-region capture enabled. Keep Roblox visible during this test.")
-        self.push_log("[Background] Normal mode remains unchanged.")
+        self.push_log("[Background] Roblox will remain a separate window. Normal mode remains unchanged.")
 
     def _background_watchdog(self):
         while not self.stopping.is_set() and not self._background_stop.is_set():
@@ -70,7 +76,7 @@ class BackgroundApi(main.Api):
                         f"via {health.capture_source}."
                     )
                     self.push_log(
-                        "[Background] This test capture is visible-region based. Do not cover Roblox yet."
+                        "[Background] Vision is using the same visible Roblox-region capture path."
                     )
                 except Exception as exc:
                     self._background_controller = None
