@@ -28,6 +28,16 @@ MK_RBUTTON = 0x0002
 MK_MBUTTON = 0x0010
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
+INPUT_MOUSE = 0
+INPUT_KEYBOARD = 1
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
+MOUSEEVENTF_MIDDLEDOWN = 0x0020
+MOUSEEVENTF_MIDDLEUP = 0x0040
+KEYEVENTF_KEYUP = 0x0002
 
 
 class POINT(ctypes.Structure):
@@ -36,6 +46,27 @@ class POINT(ctypes.Structure):
 
 class RECT(ctypes.Structure):
     _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long), ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD)]
+
+
+class INPUTUNION(ctypes.Union):
+    _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
+
+
+class INPUT(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = [("type", wintypes.DWORD), ("u", INPUTUNION)]
 
 
 @dataclass(frozen=True)
@@ -90,6 +121,22 @@ def _capture_client(hwnd: int):
         return frame.copy()
 
 
+def _send_mouse(flags: int) -> None:
+    extra = ctypes.c_ulong(0)
+    inp = INPUT(type=INPUT_MOUSE, mi=MOUSEINPUT(0, 0, 0, flags, 0, ctypes.pointer(extra)))
+    sent = user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+    if sent != 1:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _send_key(vk: int, flags: int = 0) -> None:
+    extra = ctypes.c_ulong(0)
+    inp = INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(int(vk), 0, flags, 0, ctypes.pointer(extra)))
+    sent = user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+    if sent != 1:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
 class BackgroundModeController:
     def __init__(self, hwnd: int):
         if not hwnd or not user32.IsWindow(hwnd):
@@ -106,22 +153,31 @@ class BackgroundModeController:
         user32.PostMessageW(self.hwnd, WM_MOUSEMOVE, 0, _make_lparam(x, y))
 
     def click(self, x: int, y: int, button: str = "left") -> None:
-        messages = {
-            "left": (WM_LBUTTONDOWN, WM_LBUTTONUP, MK_LBUTTON),
-            "right": (WM_RBUTTONDOWN, WM_RBUTTONUP, MK_RBUTTON),
-            "middle": (WM_MBUTTONDOWN, WM_MBUTTONUP, MK_MBUTTON),
-        }
-        down, up, mask = messages[button]
-        lp = _make_lparam(x, y)
-        user32.PostMessageW(self.hwnd, WM_MOUSEMOVE, mask, lp)
-        user32.PostMessageW(self.hwnd, down, mask, lp)
-        user32.PostMessageW(self.hwnd, up, 0, lp)
+        """Use real Windows input for Roblox, restoring the previous app focus."""
+        sx, sy = _client_origin_screen(self.hwnd)
+        screen_x, screen_y = sx + int(x), sy + int(y)
+        previous = user32.GetForegroundWindow()
+        if not user32.SetForegroundWindow(self.hwnd):
+            raise ctypes.WinError(ctypes.get_last_error())
+        time.sleep(0.05)
+        user32.SetCursorPos(screen_x, screen_y)
+        flags = {
+            "left": (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+            "right": (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+            "middle": (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+        }[button]
+        _send_mouse(flags[0])
+        time.sleep(0.03)
+        _send_mouse(flags[1])
+        time.sleep(0.05)
+        if previous and user32.IsWindow(previous) and previous != self.hwnd:
+            user32.SetForegroundWindow(previous)
 
     def key_down(self, vk: int) -> None:
-        user32.PostMessageW(self.hwnd, WM_KEYDOWN, int(vk), 0)
+        _send_key(vk)
 
     def key_up(self, vk: int) -> None:
-        user32.PostMessageW(self.hwnd, WM_KEYUP, int(vk), 0)
+        _send_key(vk, KEYEVENTF_KEYUP)
 
     def tap(self, vk: int, hold: float = 0.03) -> None:
         self.key_down(vk)
@@ -154,8 +210,6 @@ class BackgroundMouse:
         if x is None or y is None:
             raise ValueError("Background clicks require coordinates")
         cx, cy = self._client(x, y)
-        self.controller.move(cx, cy)
-        time.sleep(0.01)
         self.controller.click(cx, cy, button)
         if hold > 0:
             time.sleep(hold)
