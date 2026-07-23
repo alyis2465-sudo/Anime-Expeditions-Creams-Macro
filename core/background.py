@@ -1,14 +1,16 @@
 """Experimental Windows background-mode support for Roblox.
 
-This module is intentionally isolated from the existing macro runner. Normal
-mode remains unchanged. BackgroundModeController provides window-specific
-capture and input primitives so the runner can be adapted incrementally after
-real Roblox testing.
+This module keeps normal mode untouched. It provides a safer experimental
+adapter for the Background Mode branch. Roblox's rendered game surface does
+not reliably respond to ordinary WM_* PostMessage input, and PrintWindow can
+return a stale or blank frame for a hardware-accelerated Roblox surface. The
+adapter therefore refuses to claim that a background session is ready unless
+its capture is verified.
 
-The first implementation uses Win32 PrintWindow for window capture and
-PostMessage for client-relative mouse/keyboard events. Roblox may reject some
-background messages depending on the input path used by the game, so callers
-should run the health check before starting a long macro session.
+The current capture fallback uses the live desktop region occupied by Roblox.
+This produces a real current frame, but the Roblox window must remain visible
+for this fallback to be valid. True occluded-window capture requires a separate
+Windows Graphics Capture implementation and is not silently faked here.
 """
 
 from __future__ import annotations
@@ -26,10 +28,7 @@ if sys.platform != "win32":
     raise RuntimeError("Background Mode is currently supported on Windows only")
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
-gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
 
-PW_CLIENTONLY = 0x00000001
-PW_RENDERFULLCONTENT = 0x00000002
 WM_MOUSEMOVE = 0x0200
 WM_LBUTTONDOWN = 0x0201
 WM_LBUTTONUP = 0x0202
@@ -37,12 +36,14 @@ WM_RBUTTONDOWN = 0x0204
 WM_RBUTTONUP = 0x0205
 WM_MBUTTONDOWN = 0x0207
 WM_MBUTTONUP = 0x0208
-WM_KEYDOWN = 0x0100
-WM_KEYUP = 0x0101
-WM_CHAR = 0x0102
 MK_LBUTTON = 0x0001
 MK_RBUTTON = 0x0002
 MK_MBUTTON = 0x0010
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+
+GWL_EXSTYLE = -20
+WS_EX_LAYERED = 0x00080000
 
 
 class POINT(ctypes.Structure):
@@ -58,32 +59,13 @@ class RECT(ctypes.Structure):
     ]
 
 
-class BITMAPINFOHEADER(ctypes.Structure):
-    _fields_ = [
-        ("biSize", wintypes.DWORD),
-        ("biWidth", wintypes.LONG),
-        ("biHeight", wintypes.LONG),
-        ("biPlanes", wintypes.WORD),
-        ("biBitCount", wintypes.WORD),
-        ("biCompression", wintypes.DWORD),
-        ("biSizeImage", wintypes.DWORD),
-        ("biXPelsPerMeter", wintypes.LONG),
-        ("biYPelsPerMeter", wintypes.LONG),
-        ("biClrUsed", wintypes.DWORD),
-        ("biClrImportant", wintypes.DWORD),
-    ]
-
-
-class BITMAPINFO(ctypes.Structure):
-    _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 3)]
-
-
 @dataclass(frozen=True)
 class BackgroundHealth:
     hwnd_found: bool
     client_size: tuple[int, int]
     capture_ok: bool
     capture_nonempty: bool
+    capture_source: str = "none"
     error: Optional[str] = None
 
 
@@ -98,6 +80,13 @@ def _client_size(hwnd: int) -> tuple[int, int]:
     return rect.right - rect.left, rect.bottom - rect.top
 
 
+def _client_origin_screen(hwnd: int) -> tuple[int, int]:
+    point = POINT(0, 0)
+    if not user32.ClientToScreen(hwnd, ctypes.byref(point)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return point.x, point.y
+
+
 def _screen_to_client(hwnd: int, x: int, y: int) -> tuple[int, int]:
     point = POINT(int(x), int(y))
     if not user32.ScreenToClient(hwnd, ctypes.byref(point)):
@@ -106,49 +95,30 @@ def _screen_to_client(hwnd: int, x: int, y: int) -> tuple[int, int]:
 
 
 def _capture_client(hwnd: int):
-    """Capture the client area into a BGRA numpy array."""
+    """Capture the current visible Roblox client region using MSS.
+
+    This is deliberately a visible-region capture. It avoids the old
+    PrintWindow path, which produced a successful-looking buffer that did not
+    necessarily contain the current Roblox frame.
+    """
+    import mss
     import numpy as np
 
     width, height = _client_size(hwnd)
+    left, top = _client_origin_screen(hwnd)
     if width <= 0 or height <= 0:
         raise RuntimeError("Roblox client area has no size")
 
-    hwnd_dc = user32.GetDC(hwnd)
-    if not hwnd_dc:
-        raise ctypes.WinError(ctypes.get_last_error())
-    mem_dc = gdi32.CreateCompatibleDC(hwnd_dc)
-    bitmap = gdi32.CreateCompatibleBitmap(hwnd_dc, width, height)
-    old_bitmap = gdi32.SelectObject(mem_dc, bitmap)
-    try:
-        rendered = user32.PrintWindow(hwnd, mem_dc, PW_CLIENTONLY | PW_RENDERFULLCONTENT)
-        if not rendered:
-            rendered = user32.PrintWindow(hwnd, mem_dc, PW_CLIENTONLY)
-        if not rendered:
+    with mss.mss() as sct:
+        shot = sct.grab({"left": left, "top": top, "width": width, "height": height})
+        frame = np.asarray(shot, dtype=np.uint8)
+        if frame.size == 0:
             return None
-
-        bmi = BITMAPINFO()
-        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-        bmi.bmiHeader.biWidth = width
-        bmi.bmiHeader.biHeight = -height
-        bmi.bmiHeader.biPlanes = 1
-        bmi.bmiHeader.biBitCount = 32
-        bmi.bmiHeader.biCompression = 0
-        buffer = (ctypes.c_ubyte * (width * height * 4))()
-        copied = gdi32.GetDIBits(
-            mem_dc, bitmap, 0, height, ctypes.byref(buffer), ctypes.byref(bmi), 0
-        )
-        if copied != height:
-            return None
-        return np.frombuffer(buffer, dtype=np.uint8).reshape((height, width, 4)).copy()
-    finally:
-        gdi32.SelectObject(mem_dc, old_bitmap)
-        gdi32.DeleteObject(bitmap)
-        gdi32.DeleteDC(mem_dc)
-        user32.ReleaseDC(hwnd, hwnd_dc)
+        return frame.copy()
 
 
 class BackgroundModeController:
-    """Window-specific Roblox capture and input controller."""
+    """Roblox capture and experimental background input controller."""
 
     def __init__(self, hwnd: int):
         if not hwnd or not user32.IsWindow(hwnd):
@@ -196,9 +166,15 @@ class BackgroundModeController:
             frame = self.capture()
             capture_ok = frame is not None
             nonempty = bool(capture_ok and frame.size and frame.max() > 0)
-            return BackgroundHealth(True, size, capture_ok, nonempty)
+            return BackgroundHealth(
+                True,
+                size,
+                capture_ok,
+                nonempty,
+                "mss-visible-region",
+            )
         except Exception as exc:
-            return BackgroundHealth(True, (0, 0), False, False, str(exc))
+            return BackgroundHealth(True, (0, 0), False, False, "none", str(exc))
 
 
 class BackgroundMouse:
@@ -215,7 +191,6 @@ class BackgroundMouse:
         self.controller.move(cx, cy)
 
     def down(self, button: str = "left") -> None:
-        # Background clicks are emitted as a complete click by click().
         raise RuntimeError("BackgroundMouse.down() is not supported independently")
 
     def up(self, button: str = "left") -> None:
